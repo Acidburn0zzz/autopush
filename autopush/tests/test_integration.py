@@ -1265,10 +1265,19 @@ class TestWebPush(IntegrationBase):
         data = uuid.uuid4().hex
         with self.legacy_endpoint():
             yield client.send_notification(data=data)
-        ts, notifs = yield deferToThread(lm_message.fetch_timestamp_messages,
-                                         uuid.UUID(client.uaid),
-                                         " ")
-        assert len(notifs) == 1
+        try_count = 0
+        while try_count < 10:
+            ts, notifs = yield deferToThread(
+                lm_message.fetch_timestamp_messages,
+                uuid.UUID(client.uaid),
+                " ")
+            if len(notifs) == 1:
+                break
+            if try_count > 2:
+                raise ("Failed to find correct number"
+                       " of notifs %s" % len(notifs))
+            time.sleep(0.2)
+            try_count += 1
 
         # Connect the client, verify the migration
         yield client.connect()
@@ -1371,7 +1380,19 @@ class TestWebPush(IntegrationBase):
         _, notifs = yield deferToThread(lm_message.fetch_timestamp_messages,
                                         uuid.UUID(client.uaid),
                                         " ")
-        assert len(notifs) == 1
+        try_count = 0
+        while try_count < 10:
+            ts, notifs = yield deferToThread(
+                lm_message.fetch_timestamp_messages,
+                uuid.UUID(client.uaid),
+                " ")
+            if len(notifs) == 1:
+                break
+            if try_count > 2:
+                raise ("Failed to find correct number"
+                       " of notifs %s" % len(notifs))
+            time.sleep(0.2)
+            try_count += 1
 
         # Connect the client, verify the migration
         yield client.connect()
