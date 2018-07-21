@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from distutils.spawn import find_executable
 from StringIO import StringIO
 from httplib import HTTPResponse  # noqa
+
+import pytest
 from mock import Mock, call, patch
 from unittest.case import SkipTest
 
@@ -39,10 +41,11 @@ from autopush.db import (
     has_connected_this_month,
     Message,
 )
-from autopush.exceptions import ItemNotFound
+from autopush.exceptions import ItemNotFound, RouterException
 from autopush.logging import begin_or_register
 from autopush.main import ConnectionApplication, EndpointApplication
-from autopush.utils import base64url_encode, normalize_id
+from autopush.router.adm import ADMAuthError
+from autopush.utils import base64url_encode, normalize_id, WebPushNotification
 from autopush.metrics import SinkMetrics, DatadogMetrics
 import autopush.tests
 from autopush.tests.support import TestingLogObserver
@@ -1934,6 +1937,253 @@ class TestFCMBridgeIntegration(IntegrationBase):
         assert ca_data['cryptokey'] == crypto_key
         assert ca_data['enc'] == salt
         assert ca_data['body'] == base64url_encode(data)
+
+
+class TestADMBrideIntegration(IntegrationBase):
+
+    class MockReply(object):
+        status_code = 200
+        json = Mock(return_value=dict())
+
+    token = ("amzn1.adm-registration.v3.VeryVeryLongString0fA1phaNumericStuff"
+             + ("a" * 256))
+
+    def _add_router(self):
+        from autopush.router.adm import ADMRouter
+        adm = ADMRouter(
+            self.ep.conf,
+            {
+                "dev": {
+                    "app_id": "amzn1.application.StringOfStuff",
+                    "client_id": "amzn1.application-oa2-client.ev4nM0reStuff",
+                    "client_secret": "deadbeef0000decafbad1111",
+                    "collapseKey": "simplepush",
+                }
+            },
+            self.ep.db.metrics,
+        )
+
+        self.ep.routers["adm"] = adm
+        self._mock_send = Mock()
+        self._mock_send.post = Mock()
+        self._mock_reply = self.MockReply
+        self._mock_send.post.return_value = self._mock_reply
+        for profile in adm.profiles:
+            adm.profiles[profile]._request = self._mock_send
+
+    def test_bad_config(self):
+        from autopush.router.adm import ADMRouter
+        with pytest.raises(IOError):
+            ADMRouter(
+                self.ep.conf,
+                {
+                    "dev": {
+                        "app_id": "amzn1.application.StringOfStuff",
+                        "client_id":
+                            "amzn1.application-oa2-client.ev4nM0reStuff",
+                        "collapseKey": "simplepush",
+                    }
+                },
+                self.ep.db.metrics,
+            )
+
+    @inlineCallbacks
+    def test_missing_token_registration(self):
+        self._add_router()
+        url = "{}/v1/{}/{}/registration".format(
+            self.ep.conf.endpoint_url,
+            "adm",
+            "dev",
+        )
+        self._mock_reply.status_code = 200
+        self._mock_reply.json.return_value = {
+            "access_token": "token",
+            "expires_in": 3000
+        }
+        response, body = yield _agent("POST", url, body=json.dumps(
+            {"foo": self.token}
+        ))
+        assert response.code == 401
+        url = "{}/v1/{}/{}/registration".format(
+            self.ep.conf.endpoint_url,
+            "adm",
+            "foo",
+        )
+        response, body = yield _agent("POST", url, body=json.dumps(
+            {"token": self.token}
+        ))
+        assert response.code == 410
+
+    @inlineCallbacks
+    def test_successful(self):
+        self._add_router()
+        url = "{}/v1/{}/{}/registration".format(
+            self.ep.conf.endpoint_url,
+            "adm",
+            "dev",
+        )
+        self._mock_reply.status_code = 200
+        self._mock_reply.json.return_value = {
+            "access_token": "token",
+            "expires_in": 3000
+        }
+        response, body = yield _agent("POST", url, body=json.dumps(
+            {"token": self.token}
+        ))
+        assert response.code == 200
+        jbody = json.loads(body)
+
+        print("Response = {}", body)
+
+        data = ("\xa2\xa5\xbd\xda\x40\xdc\xd1\xa5\xf9\x6a\x60\xa8\x57\x7b\x48"
+                "\xe4\x43\x02\x5a\x72\xe0\x64\x69\xcd\x29\x6f\x65\x44\x53\x78"
+                "\xe1\xd9\xf6\x46\x26\xce\x69")
+        crypto_key = ("keyid=p256dh;dh=BAFJxCIaaWyb4JSkZopERL9MjXBeh3WdBxew"
+                      "SYP0cZWNMJaT7YNaJUiSqBuGUxfRj-9vpTPz5ANmUYq3-u-HWOI")
+        salt = "keyid=p256dh;salt=S82AseB7pAVBJ2143qtM3A"
+        content_encoding = "aesgcm"
+
+        self._mock_reply.json.return_value = dict(access_token="access.123")
+
+        response, body = yield _agent(
+            'POST',
+            str(jbody['endpoint']),
+            headers=Headers({
+                "crypto-key": [crypto_key],
+                "encryption": [salt],
+                "ttl": ["0"],
+                ""
+                "content-encoding": [content_encoding],
+            }),
+            body=data
+        )
+        print ("Response: %s" % response.code)
+        assert response.code == 201
+
+        ca_data = self._mock_send.post.mock_calls[1][2]['json']['data']
+        # ChannelID here MUST match what we got from the registration call.
+        # Currently, this is a lowercase, hex UUID without dashes.
+        assert ca_data['chid'] == jbody['channelID']
+        assert ca_data['con'] == content_encoding
+        assert ca_data['cryptokey'] == crypto_key
+        assert ca_data['enc'] == salt
+        assert ca_data['body'] == base64url_encode(data)
+
+    @inlineCallbacks
+    def test_bad_registration(self):
+        self._add_router()
+        url = "{}/v1/{}/{}/registration".format(
+            self.ep.conf.endpoint_url,
+            "adm",
+            "dev",
+        )
+        self._mock_reply.status_code = 400
+        response, body = yield _agent("POST", url, body=json.dumps(
+            {"token": self.token[:-100]}
+        ))
+        assert response.code == 400
+
+    @inlineCallbacks
+    def test_bad_token_refresh(self):
+        self._add_router()
+        url = "{}/v1/{}/{}/registration".format(
+            self.ep.conf.endpoint_url,
+            "adm",
+            "dev",
+        )
+        self._mock_reply.status_code = 200
+        response, body = yield _agent("POST", url, body=json.dumps(
+            {"token": self.token}
+        ))
+        assert response.code == 200
+        jbody = json.loads(body)
+        data = ("\xa2\xa5\xbd\xda\x40\xdc\xd1\xa5\xf9\x6a\x60\xa8\x57\x7b\x48"
+                "\xe4\x43\x02\x5a\x72\xe0\x64\x69\xcd\x29\x6f\x65\x44\x53\x78"
+                "\xe1\xd9\xf6\x46\x26\xce\x69")
+        crypto_key = ("keyid=p256dh;dh=BAFJxCIaaWyb4JSkZopERL9MjXBeh3WdBxew"
+                      "SYP0cZWNMJaT7YNaJUiSqBuGUxfRj-9vpTPz5ANmUYq3-u-HWOI")
+        salt = "keyid=p256dh;salt=S82AseB7pAVBJ2143qtM3A"
+        content_encoding = "aesgcm"
+        self._mock_reply.status_code = 400
+        self._mock_reply.text = "Test error"
+        self._mock_reply.content = "Test content"
+        response, body = yield _agent(
+            'POST',
+            str(jbody['endpoint']),
+            headers=Headers({
+                "crypto-key": [crypto_key],
+                "encryption": [salt],
+                "ttl": ["0"],
+                "content-encoding": [content_encoding],
+            }),
+            body=data
+        )
+        assert response.code == 500
+
+    def test_bad_sends(self):
+        from requests.exceptions import ConnectionError
+        self._add_router()
+
+        # prevent the token refresh check
+        self.ep.routers["adm"].profiles["dev"]._auth_token = "SomeToken"
+        self.ep.routers["adm"].profiles["dev"]._token_exp = time.time() + 300
+        self._mock_reply.status_code = 400
+        self._mock_reply.text = "Test error"
+        self._mock_reply.content = "Test content"
+
+        # This will call RouterException, which may halt the test thread.
+        # So call the function directly and verify that it raises the
+        # expected exception.
+        with pytest.raises(RouterException):
+            self.ep.routers["adm"].profiles["dev"].send(
+                reg_id="registration_id",
+                payload="BunchOfStuff",
+                ttl=300,
+                collapseKey="SomeKey"
+            )
+
+        guid = uuid.uuid4()
+        notification = WebPushNotification.from_serialized(
+            uaid=guid,
+            data=dict(
+                version="version",
+                ttl=0,
+                channelID=guid.hex,
+                )
+            )
+        uaid_data = {"router_data": {"creds": {"profile": "dev"}}}
+
+        def fcon(*args, **kwargs):
+            raise ConnectionError
+
+        self._mock_send.post.side_effect = fcon
+        with pytest.raises(RouterException):
+            self.ep.routers["adm"]._route(
+                notification=notification,
+                uaid_data=uaid_data
+            )
+
+        def faut(*args, **kwargs):
+            raise ADMAuthError
+
+        self._mock_send.post.side_effect = faut
+        with pytest.raises(RouterException):
+            self.ep.routers["adm"]._route(
+                notification=notification,
+                uaid_data=uaid_data
+            )
+
+        def fexp(*args, **kwargs):
+            raise Exception
+
+        self._mock_send.post.side_effect = fexp
+        with pytest.raises(RouterException):
+            self.ep.routers["adm"]._route(
+                notification=notification,
+                uaid_data=uaid_data
+            )
+
+        self._mock_send.post.side_effect = None
 
 
 class TestAPNSBridgeIntegration(IntegrationBase):
